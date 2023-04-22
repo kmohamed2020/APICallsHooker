@@ -25,7 +25,7 @@ PCHAR GetBaseName(PCHAR cpLine)
     return cpLine;
 }
 
-BOOL InsensitveStrCmp(PCHAR cpStr1, PCHAR cpStr2, SIZE_T nSize)
+BOOL InsensitiveStrCmp(PCHAR cpStr1, PCHAR cpStr2, SIZE_T nSize)
 {
     CHAR c1, c2;
 
@@ -34,11 +34,21 @@ BOOL InsensitveStrCmp(PCHAR cpStr1, PCHAR cpStr2, SIZE_T nSize)
         c1 = *cpStr1++;
         c2 = *cpStr2++;
 
+        /*
+            a => 0x61 => 0b01100001, n => 0x6e => 0b01101110
+            A => 0x41 => 0b01000001, N => 0x4e => 0b01001110
+                             ^                        ^
+            Only the difference is in this bit, we check if not set then we dealing with uppercase,
+            We have two ways two convert, either addition the char by 0x20 or set the fifth bit using bitwise operation.
+        */
         if ( !(c1 & (1 << 5)) ) // Check if not lowercase
-            c1 += 20; // Convert to lowercase
+            c1 += 0x20; // Convert to lowercase
+        //  c1 &= (1 << 5) ^ 0xff; // In case ('A') => 0b01000001 & 0b11011111 = 0b01100001 ('a')
 
         if ( !(c2 & (1 << 5)) ) // Check if not lowercase
-            c2 += 20; // Convert to lowercase
+            c2 += 0x20; // Convert to lowercase
+        //  c2 &= (1 << 5) ^ 0xff; // In case ('A') => 0b01000001 & 0b11011111 = 0b01100001 ('a')
+
 
         if ( c1 != c2 ) return FALSE;
     }
@@ -46,6 +56,7 @@ BOOL InsensitveStrCmp(PCHAR cpStr1, PCHAR cpStr2, SIZE_T nSize)
     return TRUE;
 }
 
+// Intialize and prepare COM Library for WMI and register Hooker Object that notifies us when a new process spawned.
 BOOL InitalizeHooker()
 {
     HookerSink* pHooker;
@@ -164,6 +175,7 @@ BOOL InitalizeHooker()
     bsQuery = SysAllocString(L"SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'");
     pHooker = new HookerSink;
 
+    // Register our Hooker object
     if (
         FAILED(
             pSvc->ExecNotificationQueryAsync(bsQueryLang, bsQuery, WBEM_FLAG_SEND_STATUS, NULL, pHooker)
@@ -195,6 +207,7 @@ BOOL InitalizeHooker()
     return TRUE;
 }
 
+// Enumerate target process DLLs and check if our dll successfully injected or not.
 BOOL IsHookingSucceed(HANDLE hProc)
 {
     HMODULE hMods[1024];
@@ -210,7 +223,7 @@ BOOL IsHookingSucceed(HANDLE hProc)
             if ( !GetModuleBaseNameA(hProc, hMods[dwNumberOfModules], cModName, MAX_PATH) )
                 return FALSE;
 
-            if ( InsensitveStrCmp((PCHAR)DLLNAME, cModName, strlen(DLLNAME)))
+            if ( InsensitiveStrCmp((PCHAR)DLLNAME, cModName, strlen(DLLNAME)))
                 return TRUE;
 
         }
@@ -238,9 +251,11 @@ BOOL HookProcess(PCHAR cpProcName, INT nProcId)
     if ( !(lpBuffer = (LPSTR) HeapAlloc(GetProcessHeap(), 0, dwSize + 1)) )
         return FALSE;
 
+    // Get Current path
     if ( !(dwSize = GetCurrentDirectoryA(dwSize + 1, lpBuffer)) )
         return FALSE;
 
+    // Join our dll file to the current path
     if ( !(PathCombineA(cFullPath, lpBuffer, DLLNAME)) )
         goto CLEANUP;
 
@@ -252,12 +267,14 @@ BOOL HookProcess(PCHAR cpProcName, INT nProcId)
         goto CLEANUP;
     }
 
+    // Always we must add one for size when dealing with strings for f**king NUL-Terminator.
     dwSize = (DWORD) strlen(cFullPath) + 1;
 
+    /* Classic DLL Injection */
     if ( !(hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, nProcId)) )
         goto CLEANUP;
 
-    if ( !(lpRemoteBuffer = VirtualAllocEx(hProc, NULL, dwSize, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)) )
+    if ( !(lpRemoteBuffer = VirtualAllocEx(hProc, NULL, dwSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) ) // We don't need RWX perm.
         goto CLEANUP;
 
     if ( !WriteProcessMemory(hProc, lpRemoteBuffer, cFullPath, dwSize, NULL) )
@@ -312,6 +329,7 @@ HRESULT HookerSink::QueryInterface(REFIID riid, void** ppv)
     return E_NOINTERFACE;
 }
 
+// This method triggered when a new process spawned, so we search in all given objects about our target process.
 HRESULT HookerSink::Indicate(long lObjCount, IWbemClassObject** pArray)
 {
     IWbemClassObject* pObj;
@@ -384,6 +402,7 @@ HRESULT HookerSink::Indicate(long lObjCount, IWbemClassObject** pArray)
             break;
         }
         
+        // Check if this is the process we are interested in
         if ( RtlEqualMemory(g_cpProcName, cpProcName, strlen(g_cpProcName)) )
         {
             if ( !HookProcess(cpProcName, _wtoi(tProcId.bstrVal)) )
@@ -422,7 +441,7 @@ INT main(INT argc, PCHAR argv[])
         return EXIT_FAILURE;
     }
 
-    if ( !(g_cpProcName = (PCHAR)HeapAlloc(GetProcessHeap(), 1, strlen(argv[0]) + 1)) )
+    if ( !(g_cpProcName = (PCHAR)HeapAlloc(GetProcessHeap(), 0, strlen(argv[0]) + 1)) )
     {
 #ifdef DEBUG
         PRINT_DEBUG("Could not allocate memory for process name.");
