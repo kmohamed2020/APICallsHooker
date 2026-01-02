@@ -4,6 +4,9 @@
 #include <fstream>
 #include <stdio.h>
 #include <chrono>
+#include <iomanip>
+#include <string>
+#include <initializer_list>
 #include <Windows.h>
 #include <Winternl.h>
 #include <shellapi.h>
@@ -20,8 +23,169 @@ using namespace std;
 #pragma warning(disable:4996)
 
 //const char* logsFile = "C:\\Windows\\Temp\\API_Calls_Monitor_Logs2.txt";
-wstring logCall;
+thread_local wstring logCall;
 int flag = 0;
+
+namespace {
+    CRITICAL_SECTION g_logLock;
+    std::wstring g_logFilePath;
+    bool g_loggerInitialized = false;
+
+    std::wstring SafeWide(LPCWSTR value)
+    {
+        return value ? std::wstring(value) : std::wstring();
+    }
+
+    std::wstring SafeWideFromUtf8(LPCSTR value)
+    {
+        return value ? s2ws(value) : std::wstring();
+    }
+
+    std::wstring CurrentTimeString()
+    {
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t seconds = std::chrono::system_clock::to_time_t(now);
+        const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) % 1000;
+
+        std::tm local_time{};
+        if (localtime_s(&local_time, &seconds) != 0)
+        {
+            return L"time unavailable";
+        }
+
+        std::wstringstream stream;
+        stream << std::put_time(&local_time, L"%Y-%m-%d %H:%M:%S")
+               << L'.' << std::setfill(L'0') << std::setw(3) << milliseconds.count();
+        return stream.str();
+    }
+
+    bool EnsureDirectoryExists(const std::wstring& directory)
+    {
+        if (CreateDirectoryW(directory.c_str(), nullptr))
+        {
+            return true;
+        }
+
+        DWORD error = GetLastError();
+        if (error == ERROR_ALREADY_EXISTS)
+        {
+            return true;
+        }
+
+        OutputDebugString((L"[-] Failed to create log directory: " + directory).c_str());
+        return false;
+    }
+
+    std::wstring ResolveLogDirectory()
+    {
+        wchar_t buffer[MAX_PATH] = { 0 };
+        DWORD env_len = GetEnvironmentVariableW(L"APICALLS_LOG_DIR", buffer, MAX_PATH);
+        std::wstring base_directory;
+
+        if (env_len > 0 && env_len < MAX_PATH)
+        {
+            base_directory.assign(buffer, env_len);
+        }
+        else
+        {
+            DWORD length = GetTempPathW(MAX_PATH, buffer);
+            if (length == 0 || length >= MAX_PATH)
+            {
+                OutputDebugString(L"[-] Failed to resolve temporary directory; using C:\\\Temp");
+                base_directory = L"C:\\Temp";
+            }
+            else
+            {
+                base_directory.assign(buffer, length);
+                if (!base_directory.empty() && base_directory.back() == L'\\')
+                {
+                    base_directory.pop_back();
+                }
+            }
+        }
+
+        std::wstring log_directory = base_directory + L"\\API_Calls_Monitor";
+        if (!EnsureDirectoryExists(log_directory))
+        {
+            return std::wstring();
+        }
+
+        return log_directory;
+    }
+
+    bool InitializeLogger()
+    {
+        if (g_loggerInitialized)
+        {
+            return true;
+        }
+
+        InitializeCriticalSection(&g_logLock);
+        std::wstring directory = ResolveLogDirectory();
+        if (directory.empty())
+        {
+            OutputDebugString(L"[-] Logger initialization failed: no writable directory.");
+            return false;
+        }
+
+        g_logFilePath = directory + L"\\API_Calls_Monitor_Logs.txt";
+        g_loggerInitialized = true;
+        return true;
+    }
+
+    bool AppendLogLine(const std::wstring& entry)
+    {
+        if (!InitializeLogger())
+        {
+            return false;
+        }
+
+        EnterCriticalSection(&g_logLock);
+        wofstream file(g_logFilePath, std::ios_base::app);
+        bool success = false;
+
+        if (file.is_open())
+        {
+            file << entry << std::endl;
+            success = file.good();
+        }
+        else
+        {
+            OutputDebugString(L"[-] Failed to open log file for append.");
+        }
+
+        LeaveCriticalSection(&g_logLock);
+
+        if (!success)
+        {
+            OutputDebugString(L"[-] Failed to flush log entry to disk.");
+        }
+
+        return success;
+    }
+
+    void LogEvent(const std::wstring& name, std::initializer_list<std::wstring> parts)
+    {
+        std::wstringstream builder;
+        builder << L"[+] " << name;
+        for (const auto& part : parts)
+        {
+            if (!part.empty())
+            {
+                builder << L" : " << part;
+            }
+        }
+
+        const std::wstring timestamp = CurrentTimeString();
+        builder << L" : " << timestamp;
+
+        if (!AppendLogLine(builder.str()))
+        {
+            OutputDebugString(L"[-] Logger failed to persist entry.");
+        }
+    }
+}
 
 
 void printError(const char* msg);
@@ -271,18 +435,7 @@ NTSTATUS WINAPI HookedNtWriteFile(HANDLE  FileHandle, HANDLE  Event, PIO_APC_ROU
     ULONG  Length, PLARGE_INTEGER   ByteOffset, PULONG  Key)
 {
     OutputDebugString(L"[+] NtWriteFile is called!!");
-
-    auto start = std::chrono::system_clock::now();
-    std::time_t end_time = std::chrono::system_clock::to_time_t(start);
-    logCall += L"[+] NtWriteFile : ";
-
-    logCall += L"  : ";
-
-    //logCall += GetCurrentProcessId();
-    logCall += L" : ";
-    //logCall += GetCurrentProcessId();
-    logCall += L" : ";
-    logCall += s2ws(std::ctime(&end_time));
+    LogEvent(L"NtWriteFile", { L"Length#" + std::to_wstring(Length) });
     return realNtWriteFile(  FileHandle,   Event,   ApcRoutine,    ApcContext,  IoStatusBlock,    Buffer,
           Length,    ByteOffset,   Key);
 }
@@ -297,21 +450,10 @@ PtrRealNtOpenFile realNtOpenFile;
 NTSTATUS WINAPI HookedNtOpenFile(PHANDLE FileHandle, ACCESS_MASK  DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock, ULONG   ShareAccess, ULONG    OpenOptions)
 {
     OutputDebugString(L"[+] NtOpenFile is called!!");
-
-    auto start = std::chrono::system_clock::now();
-    std::time_t end_time = std::chrono::system_clock::to_time_t(start);
-    logCall += L"[+] NtOpenFile : ";
-
-    logCall += L"  : ";
     WCHAR szTest[256];
     swprintf_s(szTest, 256 ,L"%d", DesiredAccess);
 
-    //logCall += GetCurrentProcessId();
-    logCall += L" : ";
-    logCall += L"ACCESS_MASK#";
-    logCall += szTest;
-    logCall += L" : ";
-    logCall += s2ws(std::ctime(&end_time));
+    LogEvent(L"NtOpenFile", { L"ACCESS_MASK#" + std::wstring(szTest) });
     return realNtOpenFile( FileHandle, DesiredAccess,  ObjectAttributes,  IoStatusBlock, ShareAccess, OpenOptions);
 }
 
@@ -328,22 +470,10 @@ PtrRealNtCreateFile realNtCreateFile;
 NTSTATUS WINAPI HookedNtCreateFile(PHANDLE  FileHandle, ACCESS_MASK  DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK   IoStatusBlock, PLARGE_INTEGER     AllocationSize, ULONG    FileAttributes, ULONG    ShareAccess, ULONG    CreateDisposition, ULONG    CreateOptions, PVOID    EaBuffer, ULONG    EaLength)
 {
     OutputDebugString(L"[+] NtCreateFile is called!!");
-
-    auto start = std::chrono::system_clock::now();
-    std::time_t end_time = std::chrono::system_clock::to_time_t(start);
-    logCall += L"[+] NtCreateFile : ";
-
-    logCall += L"  : ";
-
     WCHAR szTest[256];
     swprintf_s(szTest, 256, L"%d", DesiredAccess);
 
-    //logCall += GetCurrentProcessId();
-    logCall += L" : ";
-    logCall += L"ACCESS_MASK#";
-    logCall += szTest;
-    logCall += L" : ";
-    logCall += s2ws(std::ctime(&end_time));
+    LogEvent(L"NtCreateFile", { L"ACCESS_MASK#" + std::wstring(szTest) });
     return realNtCreateFile(  FileHandle,         DesiredAccess,  ObjectAttributes,    IoStatusBlock,      AllocationSize,     FileAttributes,     ShareAccess,     CreateDisposition,     CreateOptions,     EaBuffer,     EaLength);
 }
 
@@ -994,10 +1124,11 @@ LSTATUS WINAPI HookedRegDeleteKeyA(HKEY hKey, LPCSTR lpSubKey)
 void printError(const char* msg)
 {
     flag = 1;
-    ofstream myfile;
-    myfile.open("C:\\Windows\\Temp\\API_Calls_Monitor_Logs.txt", std::ios_base::app);
-    myfile << msg;
-    myfile.close();
+    std::wstring wideMsg = s2ws(msg);
+    if (!AppendLogLine(wideMsg))
+    {
+        OutputDebugString(L"[-] Failed to record error message.");
+    }
 }
 
 
@@ -1284,15 +1415,9 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD  ul_reason_for_call,  LPVOID lpRes
 {
 
     HANDLE currProc = GetCurrentProcess();
-  
 
-    auto start = std::chrono::system_clock::now();
-    std::time_t end_time = std::chrono::system_clock::to_time_t(start);
-    ofstream myfile;
-    myfile.open("C:\\Windows\\Temp\\API_Calls_Monitor_Logs.txt");
-    // myfile << "[+] DLLMain Entry.\n" << "[+] API Calls Monitor Started at: " << "[+] process ID: " << GetCurrentProcessId() << endl;
-    myfile << "[+] DLLMain Entry.\n" << "[+] API Calls Monitor Started at: " << std::ctime(&end_time) << "[+] process ID: " << GetCurrentProcessId() << endl;
-    myfile.close();
+    InitializeLogger();
+    LogEvent(L"DLLMain Entry", { L"process ID#" + std::to_wstring(GetCurrentProcessId()) });
   
     switch (ul_reason_for_call)
     {
@@ -1304,9 +1429,10 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD  ul_reason_for_call,  LPVOID lpRes
             
 
             OutputDebugString(L"[+] DLL is Attached \n");
+            LogEvent(L"DLL_PROCESS_ATTACH", { L"Process#" + std::to_wstring(GetCurrentProcessId()) });
 
             DisableThreadLibraryCalls(hModule);
-           
+
             InstallHook();
 
             break;
@@ -1322,20 +1448,16 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD  ul_reason_for_call,  LPVOID lpRes
         case DLL_PROCESS_DETACH:
         {
 
-            
+
           //  printError("[+] DLL is Deattached.\n");
 
             UninstallHook();
-            OutputDebugString(logCall.c_str());
-            wofstream myfile1;
-            flag = 1;
+            LogEvent(L"DLL_PROCESS_DETACH", { L"Process#" + std::to_wstring(GetCurrentProcessId()) });
 
-           
-
-
-            myfile1.open("C:\\Windows\\Temp\\API_Calls_Monitor_Logs.txt", std::ios_base::app);
-            myfile1 << logCall;
-            myfile1.close();
+            if (g_loggerInitialized)
+            {
+                DeleteCriticalSection(&g_logLock);
+            }
 
             break;
         }
